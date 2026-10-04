@@ -7,6 +7,8 @@ import time
 
 type_cache = {}
 evolution_cache = {}
+ability_cache = {}
+move_cache = {}
 
 def get_type_damage_relations(type_url, session):
     if not type_url:
@@ -39,23 +41,132 @@ def get_evolution_chain(url, session):
         chain_data = res.json().get('chain', {})
         evolutions = []
 
-        def traverse_chain(node):
-            if not node:
+        def traverse(curr, details=None):
+            if not curr:
                 return
-            species = node.get('species')
-            if species and 'name' in species:
-                evolutions.append(species['name'])
-            for evolve_to in node.get('evolves_to', []):
-                traverse_chain(evolve_to)
+            species = curr.get('species', {})
+            sp_name = species.get('name', '')
+            sp_url = species.get('url', '')
+
+            sp_id = None
+            if sp_url:
+                parts = sp_url.strip('/').split('/')
+                if parts and parts[-1].isdigit():
+                    sp_id = int(parts[-1])
+
+            condition = None
+            min_level = None
+            trigger = None
+            item = None
+
+            if details and len(details) > 0:
+                det = details[0]
+                min_level = det.get('min_level')
+                trigger_obj = det.get('trigger') or {}
+                trigger = trigger_obj.get('name')
+                item_obj = det.get('item') or {}
+                item = item_obj.get('name')
+
+                if min_level:
+                    condition = f"Nv. {min_level}"
+                elif item:
+                    condition = f"Piedra {item.replace('-', ' ').title()}"
+                elif trigger == 'trade':
+                    condition = "Intercambio"
+                elif det.get('min_happiness'):
+                    condition = "Felicidad"
+                elif trigger:
+                    condition = trigger.replace('-', ' ').title()
+
+            evolutions.append({
+                "id": sp_id,
+                "name": sp_name,
+                "min_level": min_level,
+                "trigger": trigger,
+                "item": item,
+                "condition": condition
+            })
+
+            for nxt in curr.get('evolves_to', []):
+                traverse(nxt, details=nxt.get('evolution_details'))
 
         if chain_data:
-            traverse_chain(chain_data)
+            traverse(chain_data)
 
         evolution_cache[url] = evolutions
         return evolutions
     except Exception as e:
         print(f"Error fetching evolution chain {url}: {e}")
         return []
+
+def get_ability_info(ability_url, ability_name, session):
+    if ability_name in ability_cache:
+        return ability_cache[ability_name]
+
+    name_es = ability_name
+    desc_es = ""
+    desc_en = ""
+    try:
+        res = session.get(ability_url, timeout=10)
+        if res.status_code == 200:
+            a_data = res.json()
+            for n in a_data.get('names', []):
+                if (n.get('language') or {}).get('name') == 'es':
+                    name_es = n.get('name')
+                    break
+            for f in a_data.get('flavor_text_entries', []):
+                lang = (f.get('language') or {}).get('name')
+                if lang == 'es' and not desc_es:
+                    desc_es = f.get('flavor_text', '').replace('\n', ' ')
+                elif lang == 'en' and not desc_en:
+                    desc_en = f.get('flavor_text', '').replace('\n', ' ')
+    except Exception:
+        pass
+
+    info = {
+        "name": ability_name,
+        "name_es": name_es,
+        "description_es": desc_es,
+        "description_en": desc_en
+    }
+    ability_cache[ability_name] = info
+    return info
+
+def get_move_info(move_url, move_name, session):
+    if move_name in move_cache:
+        return move_cache[move_name]
+
+    m_info = {
+        "name": move_name,
+        "name_es": move_name,
+        "type": "normal",
+        "category": "physical",
+        "power": None,
+        "accuracy": None,
+        "pp": 20
+    }
+    try:
+        res = session.get(move_url, timeout=10)
+        if res.status_code == 200:
+            m_data = res.json()
+            for n in m_data.get('names', []):
+                if (n.get('language') or {}).get('name') == 'es':
+                    m_info["name_es"] = n.get('name')
+                    break
+            type_obj = m_data.get('type') or {}
+            m_info["type"] = type_obj.get('name', 'normal')
+
+            dmg_obj = m_data.get('damage_class') or {}
+            m_info["category"] = dmg_obj.get('name', 'physical')
+
+            m_info["power"] = m_data.get('power')
+            m_info["accuracy"] = m_data.get('accuracy')
+            m_info["pp"] = m_data.get('pp')
+    except Exception:
+        pass
+
+    move_cache[move_name] = m_info
+    return m_info
 
 def fetch_pokemon_data():
     base_url = "https://pokeapi.co/api/v2"
@@ -118,8 +229,39 @@ def fetch_pokemon_data():
                     strengths_set.update(s)
 
             stats = {s['stat']['name']: s['base_stat'] for s in p_data.get('stats', []) if 'stat' in s and 'name' in s['stat']}
-            abilities = [a['ability']['name'] for a in p_data.get('abilities', []) if 'ability' in a and 'name' in a['ability']]
-            moves = [m['move']['name'] for m in p_data.get('moves', []) if 'move' in m and 'name' in m['move']]
+
+            # Rich abilities
+            abilities = []
+            for a in p_data.get('abilities', []):
+                a_obj = a.get('ability') or {}
+                a_name = a_obj.get('name')
+                a_url = a_obj.get('url')
+                if a_name and a_url:
+                    info = get_ability_info(a_url, a_name, session).copy()
+                    info['is_hidden'] = a.get('is_hidden', False)
+                    abilities.append(info)
+
+            # Rich moves
+            moves = []
+            for m in p_data.get('moves', []):
+                m_obj = m.get('move') or {}
+                m_name = m_obj.get('name')
+                m_url = m_obj.get('url')
+                if not m_name or not m_url:
+                    continue
+                m_info = get_move_info(m_url, m_name, session).copy()
+                vg_details = m.get('version_group_details', [])
+                level = 0
+                learn_method = 'level-up'
+                if vg_details:
+                    latest_vg = vg_details[-1]
+                    level = latest_vg.get('level_learned_at', 0)
+                    method_obj = latest_vg.get('move_learn_method') or {}
+                    learn_method = method_obj.get('name', 'level-up')
+
+                m_info['level'] = level
+                m_info['learn_method'] = learn_method
+                moves.append(m_info)
 
             evolution_url = (s_data.get('evolution_chain') or {}).get('url')
             evolutions = get_evolution_chain(evolution_url, session) if evolution_url else []
@@ -155,7 +297,7 @@ def fetch_pokemon_data():
 
             all_pokemon_details.append(poke_model)
 
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         except Exception as e:
             print(f"Error processing {name}: {e}")
