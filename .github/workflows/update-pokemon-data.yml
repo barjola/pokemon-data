@@ -24,9 +24,8 @@ jobs:
           pip install requests
 
       - name: Run script to fetch data and generate zip
-        run: |
-          cd pokemon_data
-          python update_data.py
+        working-directory: pokemon_data
+        run: python update_data.py
 
       - name: Commit and push changes
         run: |

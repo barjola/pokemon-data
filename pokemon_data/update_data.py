@@ -5,38 +5,67 @@ import os
 import shutil
 import time
 
-def get_type_damage_relations(type_url):
-    res = requests.get(type_url)
-    if res.status_code != 200:
+type_cache = {}
+evolution_cache = {}
+
+def get_type_damage_relations(type_url, session):
+    if not type_url:
         return [], []
-    data = res.json()
-    weaknesses = [t['name'] for t in data['damage_relations']['double_damage_from']]
-    strengths = [t['name'] for t in data['damage_relations']['double_damage_to']]
-    return weaknesses, strengths
+    if type_url in type_cache:
+        return type_cache[type_url]
+    try:
+        res = session.get(type_url, timeout=15)
+        if res.status_code != 200:
+            return [], []
+        data = res.json()
+        weaknesses = [t['name'] for t in data.get('damage_relations', {}).get('double_damage_from', []) if 'name' in t]
+        strengths = [t['name'] for t in data.get('damage_relations', {}).get('double_damage_to', []) if 'name' in t]
+        type_cache[type_url] = (weaknesses, strengths)
+        return weaknesses, strengths
+    except Exception as e:
+        print(f"Error fetching type {type_url}: {e}")
+        return [], []
 
-def get_evolution_chain(url):
-    res = requests.get(url)
-    if res.status_code != 200:
+def get_evolution_chain(url, session):
+    if not url:
         return []
+    if url in evolution_cache:
+        return evolution_cache[url]
+    try:
+        res = session.get(url, timeout=15)
+        if res.status_code != 200:
+            return []
 
-    chain_data = res.json().get('chain', {})
-    evolutions = []
+        chain_data = res.json().get('chain', {})
+        evolutions = []
 
-    def traverse_chain(node):
-        evolutions.append(node['species']['name'])
-        for evolve_to in node.get('evolves_to', []):
-            traverse_chain(evolve_to)
+        def traverse_chain(node):
+            if not node:
+                return
+            species = node.get('species')
+            if species and 'name' in species:
+                evolutions.append(species['name'])
+            for evolve_to in node.get('evolves_to', []):
+                traverse_chain(evolve_to)
 
-    if chain_data:
-        traverse_chain(chain_data)
+        if chain_data:
+            traverse_chain(chain_data)
 
-    return evolutions
+        evolution_cache[url] = evolutions
+        return evolutions
+    except Exception as e:
+        print(f"Error fetching evolution chain {url}: {e}")
+        return []
 
 def fetch_pokemon_data():
     base_url = "https://pokeapi.co/api/v2"
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'PokemonDataCollector/1.0'
+    })
 
     print("Fetching all pokemon list...")
-    response = requests.get(f"{base_url}/pokemon?limit=10000")
+    response = session.get(f"{base_url}/pokemon?limit=10000", timeout=30)
     results = response.json().get('results', [])
 
     if os.path.exists("temp_data"):
@@ -51,22 +80,25 @@ def fetch_pokemon_data():
         print(f"[{i+1}/{total}] Processing {name}...")
 
         try:
-            p_res = requests.get(p['url'])
+            p_res = session.get(p['url'], timeout=15)
             if p_res.status_code != 200:
                 continue
             p_data = p_res.json()
 
             p_id = p_data['id']
 
-            s_res = requests.get(p_data['species']['url'])
-            if s_res.status_code != 200:
-                continue
-            s_data = s_res.json()
+            species_url = (p_data.get('species') or {}).get('url')
+            s_data = {}
+            if species_url:
+                s_res = session.get(species_url, timeout=15)
+                if s_res.status_code == 200:
+                    s_data = s_res.json()
 
             names_trans = {}
-            for n in s_data['names']:
-                if n['language']['name'] in ['es', 'en']:
-                    names_trans[n['language']['name']] = n['name']
+            for n in s_data.get('names', []):
+                lang = (n.get('language') or {}).get('name')
+                if lang in ['es', 'en']:
+                    names_trans[lang] = n.get('name')
 
             es_name = names_trans.get('es', names_trans.get('en', name))
             en_name = names_trans.get('en', name)
@@ -74,28 +106,32 @@ def fetch_pokemon_data():
             types = []
             weaknesses_set = set()
             strengths_set = set()
-            for t in p_data['types']:
-                t_name = t['type']['name']
-                types.append(t_name)
-                w, s = get_type_damage_relations(t['type']['url'])
-                weaknesses_set.update(w)
-                strengths_set.update(s)
+            for t in p_data.get('types', []):
+                t_obj = t.get('type') or {}
+                t_name = t_obj.get('name')
+                t_url = t_obj.get('url')
+                if t_name:
+                    types.append(t_name)
+                if t_url:
+                    w, s = get_type_damage_relations(t_url, session)
+                    weaknesses_set.update(w)
+                    strengths_set.update(s)
 
-            stats = {s['stat']['name']: s['base_stat'] for s in p_data['stats']}
+            stats = {s['stat']['name']: s['base_stat'] for s in p_data.get('stats', []) if 'stat' in s and 'name' in s['stat']}
+            abilities = [a['ability']['name'] for a in p_data.get('abilities', []) if 'ability' in a and 'name' in a['ability']]
+            moves = [m['move']['name'] for m in p_data.get('moves', []) if 'move' in m and 'name' in m['move']]
 
-            abilities = [a['ability']['name'] for a in p_data['abilities']]
+            evolution_url = (s_data.get('evolution_chain') or {}).get('url')
+            evolutions = get_evolution_chain(evolution_url, session) if evolution_url else []
 
-            # Moves (limit to some to keep size reasonable, or take all)
-            moves = [m['move']['name'] for m in p_data['moves']]
+            sprites = p_data.get('sprites') or {}
+            other_sprites = sprites.get('other') or {}
+            official_artwork = other_sprites.get('official-artwork') or {}
+            img_url = official_artwork.get('front_default') or sprites.get('front_default')
 
-            # Evolutions
-            evolution_url = s_data.get('evolution_chain', {}).get('url')
-            evolutions = get_evolution_chain(evolution_url) if evolution_url else []
-
-            img_url = p_data['sprites']['other']['official-artwork']['front_default']
             has_image = False
             if img_url:
-                img_res = requests.get(img_url)
+                img_res = session.get(img_url, timeout=15)
                 if img_res.status_code == 200:
                     with open(f"temp_data/images/{p_id}.png", 'wb') as f:
                         f.write(img_res.content)
@@ -108,8 +144,8 @@ def fetch_pokemon_data():
                 "types": types,
                 "stats": stats,
                 "abilities": abilities,
-                "height": p_data['height'],
-                "weight": p_data['weight'],
+                "height": p_data.get('height'),
+                "weight": p_data.get('weight'),
                 "has_image": has_image,
                 "weaknesses": list(weaknesses_set),
                 "strengths": list(strengths_set),
@@ -119,9 +155,7 @@ def fetch_pokemon_data():
 
             all_pokemon_details.append(poke_model)
 
-
-            # Simple rate limiting logic to avoid 429
-            time.sleep(0.5)
+            time.sleep(0.1)
 
         except Exception as e:
             print(f"Error processing {name}: {e}")
